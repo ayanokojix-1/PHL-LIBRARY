@@ -3,7 +3,9 @@ const cors = require("cors");
 const multer = require("multer");
 const { Readable } = require("stream");
 const { uploadToChannel, getFileUrl } = require("./telegram");
+const { gdrivePreviewUrl, gdriveDownloadUrl } = require("./gdrive");
 const pool = require("./db");
+const migrate = require("./migrate");
 require("dotenv").config();
 
 const app = express();
@@ -23,30 +25,44 @@ app.get("/", (req, res) => {
 // Upload a document
 app.post("/documents", upload.single("file"), async (req, res) => {
     try {
-        const { title, description, course_code, level, type, uploaded_by } = req.body;
+        const { title, description, course_code, level, type, uploaded_by, storage, gdrive_url } = req.body;
 
-        if (!req.file) return res.status(400).json({ message: "No file uploaded" });
         if (!title) return res.status(400).json({ message: "Title is required" });
 
-        const fileId = await uploadToChannel(req.file.buffer, req.file.originalname);
+        const provider = storage === "gdrive" ? "gdrive" : "telegram";
+        let insertQuery, insertParams;
 
-        const { rows } = await pool.query(
-            `INSERT INTO documents (title, description, course_code, level, type, telegram_file_id, filename, file_size, uploaded_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             RETURNING *`,
-            [
-                title,
-                description || null,
-                course_code || null,
-                level || null,
-                type || "general",
-                fileId,
-                req.file.originalname,
-                req.file.size,
-                uploaded_by || null
-            ]
-        );
+        if (provider === "gdrive") {
+            if (!gdrive_url) return res.status(400).json({ message: "Google Drive link is required" });
 
+            insertQuery = `
+                INSERT INTO documents
+                    (title, description, course_code, level, type, uploaded_by,
+                     storage_provider, gdrive_web_view_link, gdrive_web_content_link)
+                VALUES ($1,$2,$3,$4,$5,$6,'gdrive',$7,$8)
+                RETURNING *`;
+            insertParams = [
+                title, description || null, course_code || null, level || null,
+                type || "general", uploaded_by || null,
+                gdrivePreviewUrl(gdrive_url), gdriveDownloadUrl(gdrive_url),
+            ];
+        } else {
+            if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+
+            const fileId = await uploadToChannel(req.file.buffer, req.file.originalname);
+            insertQuery = `
+                INSERT INTO documents
+                    (title, description, course_code, level, type, telegram_file_id, filename, file_size, uploaded_by,
+                     storage_provider)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'telegram')
+                RETURNING *`;
+            insertParams = [
+                title, description || null, course_code || null, level || null,
+                type || "general", fileId, req.file.originalname, req.file.size, uploaded_by || null,
+            ];
+        }
+
+        const { rows } = await pool.query(insertQuery, insertParams);
         res.status(201).json({ document: rows[0] });
     } catch (error) {
         console.error(error);
@@ -111,23 +127,29 @@ app.get("/documents/:id", async (req, res) => {
     }
 });
 
-// Stream — fetch from Telegram and serve inline
+// Stream — serve inline (redirect for GDrive, proxy for Telegram)
 app.get("/documents/:id/stream", async (req, res) => {
     try {
         const { rows } = await pool.query(
             `UPDATE documents SET view_count = view_count + 1
-             WHERE id = $1 RETURNING telegram_file_id, filename`,
+             WHERE id = $1 RETURNING telegram_file_id, filename, storage_provider, gdrive_web_view_link`,
             [req.params.id]
         );
 
         if (!rows.length) return res.status(404).json({ message: "Document not found" });
 
-        const fileUrl = await getFileUrl(rows[0].telegram_file_id);
+        const doc = rows[0];
+        console.log(doc)
+        if (doc.storage_provider === "gdrive") {
+            return res.redirect(gdrivePreviewUrl(doc.gdrive_web_view_link));
+        }
+
+        const fileUrl = await getFileUrl(doc.telegram_file_id);
         const upstream = await fetch(fileUrl);
 
         if (!upstream.ok) return res.status(502).json({ message: "Could not fetch document" });
 
-        const ext = (rows[0].filename || "").split(".").pop().toLowerCase();
+        const ext = (doc.filename || "").split(".").pop().toLowerCase();
         const contentTypes = {
             pdf: "application/pdf",
             doc: "application/msword",
@@ -145,24 +167,30 @@ app.get("/documents/:id/stream", async (req, res) => {
     }
 });
 
-// Download — fetch from Telegram and serve as attachment
+// Download — serve as attachment (redirect for GDrive, proxy for Telegram)
 app.get("/documents/:id/download", async (req, res) => {
     try {
         const { rows } = await pool.query(
             `UPDATE documents SET download_count = download_count + 1
-             WHERE id = $1 RETURNING telegram_file_id, title, filename`,
+             WHERE id = $1 RETURNING telegram_file_id, title, filename, storage_provider, gdrive_web_content_link`,
             [req.params.id]
         );
 
         if (!rows.length) return res.status(404).json({ message: "Document not found" });
 
-        const fileUrl = await getFileUrl(rows[0].telegram_file_id);
+        const doc = rows[0];
+
+        if (doc.storage_provider === "gdrive") {
+            return res.redirect(doc.gdrive_web_content_link);
+        }
+
+        const fileUrl = await getFileUrl(doc.telegram_file_id);
         const upstream = await fetch(fileUrl);
 
         if (!upstream.ok) return res.status(502).json({ message: "Could not fetch document" });
 
         res.setHeader("Content-Type", upstream.headers.get("content-type") || "application/octet-stream");
-        res.setHeader("Content-Disposition", `attachment; filename="${rows[0].filename || rows[0].title}"`);
+        res.setHeader("Content-Disposition", `attachment; filename="${doc.filename || doc.title}"`);
 
         Readable.fromWeb(upstream.body).pipe(res);
     } catch (error) {
@@ -171,6 +199,11 @@ app.get("/documents/:id/download", async (req, res) => {
     }
 });
 
-app.listen(3000, () => {
-    console.log("Server running on port 3000");
+migrate().then(() => {
+    app.listen(3000, () => {
+        console.log("Server running on port 3000");
+    });
+}).catch(err => {
+    console.error("Migration failed, server not started:", err.message);
+    process.exit(1);
 });
